@@ -46,13 +46,13 @@ void SearchClient::onConnection(const TcpConnectionPtr& conn)
         // 连接建立成功，保存连接指针
         connection_ = conn;
         spdlog::info("Connected to server: {}", conn->peerAddress().toIpPort());
-        cout << "=== Connected to search server ===" << endl;
-        cout<<"'/w': 关键字推荐  '/p': 网页搜索 '/quit': 退出" <<endl;
+        cout << "========= 已连接到搜索引擎服务器 =========" << endl;
+        cout<<">"<<flush;
     } else {
         // 连接断开，重置连接指针
         connection_.reset();
         spdlog::info("Disconnected from server");
-        cout << "=== Disconnected from server ===" << endl;
+        cout << "========= Disconnected from server =========" << endl;
         // 退出事件循环，程序结束
         loop_->quit();
     }
@@ -72,6 +72,7 @@ void SearchClient::onEntireMessage(const TcpConnectionPtr& conn,
         case MsgType::PageResp: {
             json data = json::parse(message);
             cout << data.dump() << endl;
+            cout<<">"<<flush;
             break;
         }
         default:

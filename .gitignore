@@ -16,12 +16,6 @@ Makefile
 # 程序生成的输出数据
 bin/
 
-# 语料库（体积大，不纳入版本控制）
-corpus/
-
-# 停用词
-stopwords/
-
 # 文档
 *.pdf
 

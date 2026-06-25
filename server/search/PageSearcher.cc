@@ -72,44 +72,69 @@ void PageSearcher::find_doc(const string& message)
         return;
     }
 
-    set<int> candidates;
-    bool first = true;
-
-    for(auto &word:keywords)
-    {
-        auto it = inverted_index_.find(word);
-        if(it == inverted_index_.end()) return;
-
-        if(first) {
-            for(auto &[doc_id, weight] : it->second)
-                candidates.insert(doc_id);
-            first = false;
-        }else {
-            set<int> tmp;
-            for(auto &[doc_id, weight] : it->second)
-                if(candidates.count(doc_id))
-                    tmp.insert(doc_id);
-            candidates = std::move(tmp);
-        }
-        if(candidates.empty()) return;
-    }
-    spdlog::info("候选文档数: {}", candidates.size());
-
-    map<int, double> doc_score;
+    // ========== P1: 渐进式放宽检索 ==========
+    // 一轮遍历：统计每个文档的关键词命中数 + BM25 总分
+    map<int, int>    doc_match_count;  // doc_id → 命中关键词数
+    map<int, double> doc_score;        // doc_id → BM25 总分
+    int total_kw = 0;                  // 实际在索引中的关键词数
 
     for(auto &kw : keywords) {
-        for(auto &[doc_id, weight] : inverted_index_[kw]) 
-        {
-            if(candidates.count(doc_id))
-            {
-                doc_score[doc_id] += weight;
-            }
+        auto it = inverted_index_.find(kw);
+        if(it == inverted_index_.end()) {
+            spdlog::debug("关键词 '{}' 不在索引中，跳过", kw);
+            continue;  // 跳过未知关键词（不再直接返回空）
+        }
+        ++total_kw;
+        for(auto &[doc_id, weight] : it->second) {
+            doc_match_count[doc_id]++;
+            doc_score[doc_id] += weight;
         }
     }
 
-    ranked_.assign(doc_score.begin(), doc_score.end());
+    if(total_kw == 0) {
+        spdlog::info("所有关键词均不在索引中，无结果");
+        return;
+    }
+
+    spdlog::info("命中关键词: {}/{}，文档候选池: {}", 
+                 total_kw, keywords.size(), doc_score.size());
+
+    // 渐进式筛选：AND → 60%匹配 → OR
+    auto apply_filter = [&](int min_match) {
+        ranked_.clear();
+        for(auto &[doc_id, score] : doc_score) {
+            if(doc_match_count[doc_id] >= min_match) {
+                ranked_.push_back({doc_id, score});
+            }
+        }
+    };
+
+    // 第1轮：严格 AND（所有关键词必须命中）
+    apply_filter(total_kw);
+    if((int)ranked_.size() >= TOP_K) {
+        spdlog::info("第1轮 AND: {} 个结果", ranked_.size());
+        goto sort_and_return;
+    }
+
+    // 第2轮：≥60% 关键词命中
+    {
+        int min_match = max(1, (total_kw * 60 + 99) / 100);  // ceil(60%)
+        if(min_match < total_kw) {  // 不重复 AND
+            apply_filter(min_match);
+            spdlog::info("第2轮 ≥{}% 匹配({}/{}): {} 个结果",
+                         60, min_match, total_kw, ranked_.size());
+        }
+    }
+    if((int)ranked_.size() >= TOP_K) goto sort_and_return;
+
+    // 第3轮：OR（命中任意关键词即可）
+    apply_filter(1);
+    spdlog::info("第3轮 OR: {} 个结果", ranked_.size());
+
+sort_and_return:
     sort(ranked_.begin(), ranked_.end(),
          [](auto &a, auto &b) { return a.second > b.second; });
+    query_keywords_ = keywords;  // P3: 保存查询关键词，供摘要生成
 }
 
 void PageSearcher::fetch_top_pages()
@@ -143,22 +168,10 @@ void PageSearcher::fetch_top_pages()
         // 提取 link
         tinyxml2::XMLElement* linkElem = root->FirstChildElement("link");
         string link = linkElem ? linkElem->GetText() : "";
-        // 提取 content → 生成摘要（前 50 个 UTF-8 字符）
+        // 提取 content → P3: 生成关键词上下文摘要
         tinyxml2::XMLElement* contentElem = root->FirstChildElement("content");
         string content = contentElem ? contentElem->GetText() : "";
-        
-        const int ABSTRACT_LEN = 50;
-        int count = 0;
-        const char *curr = content.c_str();
-        const char *end  = content.c_str() + content.size();
-
-        string abstract;
-        while (count <= ABSTRACT_LEN && curr != end) {
-            auto start = curr;
-            utf8::next(curr, end);
-            abstract.append(start, curr);
-            ++count;
-        }
+        string abstract = generate_kwic_abstract(content);
 
         Page page;
         page.id       = doc_id;
@@ -179,6 +192,97 @@ void PageSearcher::clear()
 {
     ranked_.clear();
     result_.clear();
+    query_keywords_.clear();
+}
+
+// ===================================================================
+// P3: 关键词上下文摘要（KWIC - Keyword in Context）
+// 在正文中定位查询关键词，取命中位置前后各 25 个 UTF-8 字符作为摘要
+// 多个命中位置窗口重叠时自动合并
+// ===================================================================
+string PageSearcher::generate_kwic_abstract(const string& content)
+{
+    const int HALF = 25;  // 命中位置前后各 25 个 UTF-8 字符
+
+    if (content.empty() || query_keywords_.empty()) {
+        return "";
+    }
+
+    // ---- 1. 构建 UTF-8 字符 → 字节偏移 映射 ----
+    vector<size_t> char_offsets;  // char_offsets[i] = 第 i 个 UTF-8 字符的起始字节位置
+    const char* curr = content.c_str();
+    const char* end  = content.c_str() + content.size();
+    while (curr != end) {
+        char_offsets.push_back(curr - content.c_str());
+        utf8::next(curr, end);
+    }
+    int total_chars = char_offsets.size();
+    if (total_chars == 0) return "";
+
+    // ---- 2. 找到所有关键词的命中位置（字节偏移 → UTF-8 字符下标） ----
+    struct Interval {
+        int begin, end;  // UTF-8 字符下标区间 [begin, end)
+        int kw_hits;     // 该区间覆盖的关键词命中次数
+    };
+    vector<Interval> intervals;
+
+    for (auto& kw : query_keywords_) {
+        if (kw.empty()) continue;
+        size_t byte_pos = 0;
+        while ((byte_pos = content.find(kw, byte_pos)) != string::npos) {
+            // 字节偏移 → UTF-8 字符下标（二分查找）
+            auto it = upper_bound(char_offsets.begin(), char_offsets.end(), byte_pos);
+            int char_idx = (it == char_offsets.begin()) ? 0 : (it - char_offsets.begin() - 1);
+
+            int win_begin = max(0, char_idx - HALF);
+            int win_end   = min(total_chars, char_idx + (int)utf8::distance(kw.begin(), kw.end()) + HALF);
+            intervals.push_back({win_begin, win_end, 1});
+
+            byte_pos += kw.size();  // 继续搜索下一个命中
+        }
+    }
+
+    if (intervals.empty()) {
+        // 关键词不在正文中，回退到前 50 个字符
+        int n = min(50, total_chars);
+        size_t byte_len = (n < total_chars) ? char_offsets[n] : content.size();
+        return content.substr(0, byte_len) + (n < total_chars ? "..." : "");
+    }
+
+    // ---- 3. 按起始位置排序 ----
+    sort(intervals.begin(), intervals.end(),
+         [](const Interval& a, const Interval& b) { return a.begin < b.begin; });
+
+    // ---- 4. 合并重叠窗口 ----
+    vector<Interval> merged;
+    for (auto& iv : intervals) {
+        if (merged.empty() || merged.back().end < iv.begin) {
+            merged.push_back(iv);
+        } else {
+            merged.back().end = max(merged.back().end, iv.end);
+            merged.back().kw_hits += iv.kw_hits;
+        }
+    }
+
+    // ---- 5. 选择最佳窗口：命中关键词最多者，相同时取较大者 ----
+    Interval best = merged[0];
+    for (auto& iv : merged) {
+        if (iv.kw_hits > best.kw_hits ||
+            (iv.kw_hits == best.kw_hits && (iv.end - iv.begin) > (best.end - best.begin))) {
+            best = iv;
+        }
+    }
+
+    // ---- 6. 截取摘要文本 ----
+    size_t byte_begin = char_offsets[best.begin];
+    size_t byte_end   = (best.end < total_chars) ? char_offsets[best.end] : content.size();
+    string snippet = content.substr(byte_begin, byte_end - byte_begin);
+
+    // ---- 7. 添加省略号 ----
+    if (best.begin > 0) snippet = "..." + snippet;
+    if (best.end < total_chars) snippet += "...";
+
+    return snippet;
 }
 
 vector<Page> PageSearcher::get_result() 
