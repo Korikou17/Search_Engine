@@ -6,11 +6,12 @@
 #include <map>
 #include <set>
 #include <utfcpp/utf8.h>
+#include <spdlog/spdlog.h>
 
 KeyWordProcessor::KeyWordProcessor()
 {
     ifstream ifs{"stopwords/cn_stopwords.txt"};
-    if(!ifs){cerr << "ifstream open file failed!" << endl;return;}
+    if(!ifs){ spdlog::error("打开停用词文件失败: stopwords/cn_stopwords.txt"); return; }
     string word;
     while(ifs>>word)
     {
@@ -18,7 +19,7 @@ KeyWordProcessor::KeyWordProcessor()
     }
     ifs.close();
     ifstream en_stop_ifs{"stopwords/en_stopwords.txt"};
-    if(!en_stop_ifs){cerr << "ifstream open file failed!" << endl;return;}
+    if(!en_stop_ifs){ spdlog::error("打开停用词文件失败: stopwords/en_stopwords.txt"); return; }
     while(en_stop_ifs>>word)
     {
         enStopWords_.emplace(word);
@@ -36,7 +37,7 @@ void KeyWordProcessor::create_en_dict_and_index(const string& dir, const string&
     for(auto& filename:enfiles)
     {
         ifstream ifs{dir+"/"+filename};
-        if(!ifs){cerr << "ifstream open file failed!" << endl;return;}
+        if(!ifs){ spdlog::error("打开文件失败: {}/{}", dir, filename); continue; }
 
         ostringstream oss;
         oss << ifs.rdbuf();
@@ -60,7 +61,7 @@ void KeyWordProcessor::create_en_dict_and_index(const string& dir, const string&
         ifs.close();
     }
     ofstream dict_ofs{dict_file};
-    if(!dict_ofs){cerr << "dict_ofs open file failed" << endl;return;}
+    if(!dict_ofs){ spdlog::error("无法创建词典文件: {}", dict_file); return; }
     for(auto &d:dict){
         dict_ofs<<d.first<<" "<<d.second<<endl;
     }
@@ -70,14 +71,14 @@ void KeyWordProcessor::create_en_dict_and_index(const string& dir, const string&
     for(auto it = dict.begin(); it != dict.end(); ++it)
     {
         int line_num=distance(dict.begin(), it) + 1;
-        cout<<it->first<<endl;
+        //cout<<it->first<<endl;
         for(auto ch=it->first.begin();ch!=it->first.end();++ch){
             charNumbers[*ch].insert(line_num);
         }
     }
 
     ofstream index_ofs{index_file};
-    if(!index_ofs){cerr << "index_ofs open file failed" << endl;return;}
+    if(!index_ofs){ spdlog::error("无法创建索引文件: {}", index_file); return; }
     for(auto &[key,value]:charNumbers){
         index_ofs<<key;
         for(auto &num:value)
@@ -114,8 +115,7 @@ void KeyWordProcessor::create_cn_dict_and_index(const string& dir, const string&
     for(auto& filename:cnfiles)
     {
         ifstream ifs{dir+"/"+filename};
-        if(!ifs){cerr << "ifstream open file failed!" << endl;return;}
-        //初始化jieba对象
+        if(!ifs){ spdlog::error("打开文件失败: {}/{}", dir, filename); continue; }
 
         ostringstream oss;
         oss << ifs.rdbuf();
@@ -136,7 +136,7 @@ void KeyWordProcessor::create_cn_dict_and_index(const string& dir, const string&
     }
 
     ofstream dict_ofs{dict_file};
-    if(!dict_ofs){cerr << "dict_ofs open file failed" << endl;return;}
+    if(!dict_ofs){ spdlog::error("无法创建词典文件: {}", dict_file); return; }
     for(auto &d:dict){
         dict_ofs<<d.first<<" "<<d.second<<endl;
     }
@@ -146,7 +146,7 @@ void KeyWordProcessor::create_cn_dict_and_index(const string& dir, const string&
     map<string, set<int> > chwordNumbers;
     for(auto word = dict.begin(); word != dict.end(); ++word)
     {
-        cout<<word->first<<endl;
+        //cout<<word->first<<endl;
         const char* curr = word->first.c_str();
         const char* end = word->first.c_str() + word->first.size();
         int line_num=distance(dict.begin(), word) + 1;
@@ -161,7 +161,7 @@ void KeyWordProcessor::create_cn_dict_and_index(const string& dir, const string&
     }
 
     ofstream index_ofs{index_file};
-    if(!index_ofs){cerr << "index_ofs open file failed" << endl;return;}
+    if(!index_ofs){ spdlog::error("无法创建索引文件: {}", index_file); return; }
     for(auto &[key,value]:chwordNumbers){
         index_ofs<<key;
         for(auto &num:value)
@@ -175,7 +175,13 @@ void KeyWordProcessor::create_cn_dict_and_index(const string& dir, const string&
 
 void KeyWordProcessor::process(const string& chDir, const string& enDir)
 {
+    spdlog::info("===== 开始生成关键词词典 & 索引 =====");
+    spdlog::info("英文词典 & 索引开始构建");
     create_en_dict_and_index(enDir,"data/dict_en.dat","data/index_en.dat");
+    spdlog::info("英文词典 & 索引构建完成");
+    spdlog::info("中文词典 & 索引开始构建");
     create_cn_dict_and_index(chDir,"data/dict_cn.dat","data/index_cn.dat");
+    spdlog::info("中文词典 & 索引构建完成");
+    spdlog::info("===== 关键词推荐处理完毕 =====");
 }
 

@@ -1,12 +1,13 @@
 #include "DirectoryScanner.h"
 #include "common.h"
 #include <string>
+#include <spdlog/spdlog.h>
 
 vector<string> DirectoryScanner::scan(const string& dir)
 {
     vector<string> result;
     DIR *dirp = opendir(dir.c_str());
-    if (!dirp) {perror("opendir");return result;}
+    if (!dirp) { spdlog::error("无法打开目录: {}", dir); return result; }
 
     struct dirent *entry;
     while ((entry = readdir(dirp)) != NULL) {

@@ -14,7 +14,7 @@ Makefile
 !CMakeLists.txt
 
 # 程序生成的输出数据
-data/
+bin/
 
 # 语料库（体积大，不纳入版本控制）
 corpus/

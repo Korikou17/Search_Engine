@@ -7,6 +7,9 @@
 #include <regex>
 #include <utfcpp/utf8.h>
 #include <cmath>
+#include <spdlog/spdlog.h>
+#include <unordered_map>
+#include <unordered_set>
 
 using namespace tinyxml2;
 using namespace simhash;
@@ -15,7 +18,7 @@ using namespace simhash;
 PageProcessor::PageProcessor()
 {
     ifstream ifs{"stopwords/en_stopwords.txt"};
-    if(!ifs){cerr << "ifstream open file failed!" << endl;return;}
+    if(!ifs){spdlog::error("打开停用词文件失败: stopwords/en_stopwords.txt");return;}
     string word;
     while(ifs>>word)
     {
@@ -32,18 +35,25 @@ void PageProcessor::extract_and_deduplicate_documents(const string& dir)
     int doc_id=1;
     //通用正则表达式
     regex reg("<[^>]+>");
+
+    // 4 张分块哈希表：块值(16位) → doc_id 列表
+    unordered_map<uint16_t, vector<int>> block_table[4];
+
     //循环文件
     for(auto &file:xmlfiles)
     {
         string filename="corpus/webpages/"+file;
         XMLDocument doc;
-        if (doc.LoadFile(filename.c_str()) != XML_SUCCESS) {cerr << "Failed to load XML file: " << doc.ErrorStr() << endl;return;}
+        if (doc.LoadFile(filename.c_str()) != XML_SUCCESS) {
+            spdlog::error("加载 XML 失败: {} ({})", filename, doc.ErrorStr());
+            continue;
+        }
 
         XMLElement *root = doc.RootElement();
-        if (!root) {cerr << "No root element found." << endl;return;}
+        if (!root) { spdlog::error("文件 {} 没有根元素", filename); continue; }
 
         XMLElement *channel = root->FirstChildElement("channel");
-        if (!channel) {cerr << "No channel element found." << endl;return;}
+        if (!channel) { spdlog::error("文件 {} 没有 channel 元素", filename); continue; }
     
         for (XMLElement* itemElem = channel->FirstChildElement("item");
             itemElem != nullptr;
@@ -53,7 +63,7 @@ void PageProcessor::extract_and_deduplicate_documents(const string& dir)
             if(!contentElem){
                 contentElem = itemElem->FirstChildElement("description");
                 if(!contentElem){
-                    cout<<"contiune"<<endl;
+                    spdlog::debug("文件 {} 中某个 item 没有 content/description，跳过", file);
                     continue;
                 }
             }
@@ -63,18 +73,31 @@ void PageProcessor::extract_and_deduplicate_documents(const string& dir)
             int topN = max(5, min(200, static_cast<int>(content.size()/120)));
             uint64_t hamming;
             hasher_.make(content, topN, hamming);
-            
-            bool flag=false;
 
-            for(auto &ele:documents_)
-            {
-                if(Simhasher::isEqual(hamming,ele.hamming))
-                {
-                    flag=true;
+            //========== 分块哈希表去重 ==========
+            uint16_t blocks[4] = {
+                static_cast<uint16_t>(hamming >> 48),
+                static_cast<uint16_t>((hamming >> 32) & 0xFFFF),
+                static_cast<uint16_t>((hamming >> 16) & 0xFFFF),
+                static_cast<uint16_t>(hamming & 0xFFFF)
+            };
+
+            unordered_set<int> candidates;
+            for (int i = 0; i < 4; ++i) {
+                auto it = block_table[i].find(blocks[i]);
+                if (it != block_table[i].end()) {
+                    candidates.insert(it->second.begin(), it->second.end());
+                }
+            }
+
+            bool flag = false;
+            for (int candidate_id : candidates) {
+                if (Simhasher::isEqual(hamming, documents_[candidate_id - 1].hamming)) {
+                    flag = true;
                     break;
                 }
             }
-            if(flag==true)continue;
+            if (flag) continue;
             
             XMLElement* titleElem = itemElem->FirstChildElement("title");
             string title = titleElem?titleElem->GetText():"";
@@ -85,7 +108,11 @@ void PageProcessor::extract_and_deduplicate_documents(const string& dir)
             link = regex_replace(link, reg, "");
 
             documents_.push_back(Document{doc_id,link,title,content,hamming});
-            cout<<doc_id<<endl;
+            for (int i = 0; i < 4; ++i) {
+                block_table[i][blocks[i]].push_back(doc_id);
+            }
+            //spdlog::debug("处理文档 #{}: {}", doc_id, title);
+            
             ++doc_id;
         } 
     }
@@ -96,9 +123,9 @@ void PageProcessor::build_pages_and_offsets(const string& pages, const string& o
 {
     //构建网页库 和 网页偏移库（每行: docid offset length）
     ofstream page_ofs{pages};
-    if(!page_ofs){cerr << "page_ofs open file failed" << endl;return;}
+    if(!page_ofs){ spdlog::error("无法创建网页库文件: {}", pages); return; }
     ofstream offset_ofs{offsets};
-    if(!offset_ofs){cerr << "offset_ofs open file failed" << endl;return;}
+    if(!offset_ofs){ spdlog::error("无法创建偏移库文件: {}", offsets); return; }
 
     for (auto &page:documents_)
     {
@@ -139,13 +166,12 @@ static bool isAllChinese(const string& word) {
 /// 构建倒排索引库
 void PageProcessor::build_inverted_index(const string& filename)
 {
-    //keyword -> <pageid, word_appear_times_in_page>
+    constexpr double k1 = 1.2;   // 词频饱和参数
+    constexpr double b  = 0.75;  // 长度归一化参数
+    double N = documents_.size();
+
+    // 统计阶段
     map<string, map<int, int>> keyword_times_in_page;
-    //keyword -> <pageid, word_frequency>
-    map<string, map<int, double>> keyword_w_in_page;
-    //每篇文档的去重单词集合
-    map<int, set<string>> page_word;   
-    // 每篇文档的总词数
     map<int, int> total_words_in_doc;
 
     for(auto &doc:documents_)
@@ -160,46 +186,38 @@ void PageProcessor::build_inverted_index(const string& filename)
                 continue;
             }
             ++keyword_times_in_page[word][doc.id];
-            page_word[doc.id].insert(word);
             ++total_words_in_doc[doc.id];
         }
     }
 
-    for(auto &[word,value]:keyword_times_in_page)
-    {
-        for(auto &[doc_id,times]:value)
-        {
-            double tf = static_cast<double>(times) / total_words_in_doc[doc_id];
-            double df = value.size();
-            double idf = log2(static_cast<double>(documents_.size()) / (df + 1.0));
-            double w = tf * idf;
-            keyword_w_in_page[word][doc_id] = w;
-        }
-    }
+    // 平均文档长度
+    double avgdl = 0;
+    for(auto &doc:documents_) avgdl += total_words_in_doc[doc.id];
+    avgdl /= N;
 
-    for(auto &[doc_id,words]:page_word)
+    // BM25 计算权重
+    for(auto &[word, value] : keyword_times_in_page)
     {
-        double sum_of_squares=0;
-        for(auto &word:words)
+        double df = value.size();
+        double idf = log2((N - df + 0.5) / (df + 0.5));
+
+        for(auto &[doc_id, tf] : value)
         {
-            double w=keyword_w_in_page[word][doc_id];
-            sum_of_squares+=w*w;
-        }
-        double RMS=sqrt(sum_of_squares);
-        for(auto &word:words)
-        {
-            invertedIndex_[word][doc_id]=keyword_w_in_page[word][doc_id]/RMS;
+            double doc_len = total_words_in_doc[doc_id];
+            double numerator   = tf * (k1 + 1.0);
+            double denominator = tf + k1 * (1.0 - b + b * doc_len / avgdl);
+            invertedIndex_[word][doc_id] = idf * numerator / denominator;
         }
     }
 
     ofstream ofs{filename};
-    if(!ofs){cerr << "ofs open file failed" << endl;return;}
+    if(!ofs){ spdlog::error("无法创建倒排索引文件: {}", filename); return; }
     for(auto &[key,value]:invertedIndex_)
     {
         ofs<<key;
-        for(auto &[id,fre]:value)
+        for(auto &[id,score]:value)
         {
-            ofs<<" "<<id<<" "<<fre;
+            ofs<<" "<<id<<" "<<score;
         }
         ofs << endl;
     }
@@ -208,7 +226,13 @@ void PageProcessor::build_inverted_index(const string& filename)
 
 void PageProcessor::process(const string& dir)
 {
+    spdlog::info("===== 开始处理网页 =====");
     extract_and_deduplicate_documents(dir);
+    spdlog::info("文档提取完成，共 {} 篇", documents_.size());
     build_pages_and_offsets("data/pages.dat","data/offsets.dat");
+    spdlog::info("网页库 & 偏移库构建完成");
+    spdlog::info("倒排索引库开始构建");
     build_inverted_index("data/inverted_index.dat");
+    spdlog::info("倒排索引库构建完成");
+    spdlog::info("===== 网页处理完毕 =====");
 }
